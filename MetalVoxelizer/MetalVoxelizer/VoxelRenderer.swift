@@ -24,6 +24,11 @@ struct Uniforms {
 }
 
 class VoxelRenderer: NSObject, MTKViewDelegate {
+    let gridSize = 100
+    let verticesPerQuad = 24
+    let indicesPerQuad = 36
+    let voxelSize:Float = 0.01
+    
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let computePipeline: MTLComputePipelineState
@@ -104,16 +109,13 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     }
     
     func generateVoxelMesh() {
-        let gridSize = 100
         let voxelCount = gridSize * gridSize * gridSize
-        let verticesPerQuad = 24
-        let indicesPerQuad = 36
 
         let maxVertices = voxelCount * verticesPerQuad
         let maxIndices = voxelCount * indicesPerQuad
 
         var params = VoxelParams(
-            voxelSize: 0.01,
+            voxelSize: voxelSize,
             gridSize: Int32(gridSize)
         )
         
@@ -145,51 +147,6 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         commandBuffer.waitUntilCompleted()
 
         indexCount = maxIndices
-    }
-
-    func perspectiveFovRH(fovY: Float, aspect: Float, nearZ: Float, farZ: Float) -> matrix_float4x4 {
-        let yScale = 1 / tan(fovY * 0.5)
-        let xScale = yScale / aspect
-        let zRange = farZ - nearZ
-        let zScale = -(farZ + nearZ) / zRange
-        let wzScale = -2 * farZ * nearZ / zRange
-
-        return matrix_float4x4(columns: (
-            SIMD4<Float>(xScale, 0, 0, 0),
-            SIMD4<Float>(0, yScale, 0, 0),
-            SIMD4<Float>(0, 0, zScale, -1),
-            SIMD4<Float>(0, 0, wzScale, 0)
-        ))
-    }
-    
-    func lookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> matrix_float4x4 {
-        let z = simd_normalize(eye - center)
-        let x = simd_normalize(simd_cross(up, z))
-        let y = simd_cross(z, x)
-
-        let t = SIMD3<Float>(
-            -simd_dot(x, eye),
-            -simd_dot(y, eye),
-            -simd_dot(z, eye)
-        )
-
-        return matrix_float4x4(columns: (
-            SIMD4<Float>(x.x, y.x, z.x, 0),
-            SIMD4<Float>(x.y, y.y, z.y, 0),
-            SIMD4<Float>(x.z, y.z, z.z, 0),
-            SIMD4<Float>(t.x, t.y, t.z, 1)
-        ))
-    }
-    
-    func makeRotationYMatrix(angle: Float) -> float4x4 {
-        let c = cos(angle)
-        let s = sin(angle)
-        return float4x4([
-            SIMD4<Float>(c, 0, -s, 0),
-            SIMD4<Float>(0, 1,  0, 0),
-            SIMD4<Float>(s, 0,  c, 0),
-            SIMD4<Float>(0, 0,  0, 1)
-        ])
     }
     
     func draw(in view: MTKView) {
@@ -225,9 +182,9 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         let elapsed = Float(currentTime - startTime)
         let speed = 0.5
         
-        let modelMatrix = makeRotationYMatrix(angle: elapsed*Float(speed))
-        let projection = perspectiveFovRH(fovY: fov, aspect: aspect, nearZ: near, farZ: far)
-        let view = lookAt(
+        let modelMatrix = Matrix.makeRotationYMatrix(angle: elapsed*Float(speed))
+        let projection = Matrix.perspectiveFovRH(fovY: fov, aspect: aspect, nearZ: near, farZ: far)
+        let view = Matrix.lookAt(
             eye: SIMD3<Float>(0, 0, 3.5),
             center: SIMD3<Float>(0, 0, 0),
             up: SIMD3<Float>(0, 1, 0)
