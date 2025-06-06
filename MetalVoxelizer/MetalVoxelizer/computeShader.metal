@@ -8,6 +8,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
+struct Voxel {
+    int3 position;       // 12 bytes
+    uchar active;        // 1 byte
+    uchar3 padding;      // 3 bytes padding
+    float4 color;        // 16 bytes
+};
+
 struct Vertex {
     float3 position;
     float3 normal;
@@ -22,21 +29,27 @@ struct VoxelParams {
 kernel void generateGeometry(
     device Vertex *vertexBuffer [[ buffer(0) ]],
     device uint *indexBuffer [[ buffer(1) ]],
-    device VoxelParams* params [[ buffer(2) ]],
+    device Voxel *voxelBuffer [[ buffer(2) ]],
+    device VoxelParams *params [[ buffer(3) ]],
     uint id [[ thread_position_in_grid ]]) {
-
+    
+    Voxel vox = voxelBuffer[id];
+    if(vox.active == 0)return;
+    
     float size = params->voxelSize;
     int gridSize = int(params->gridSize);
     float spacing = size * 1.1;
 
     int x = (id % gridSize) - ((gridSize-1)/2);
-    int y = ((id / gridSize) % gridSize) - ((gridSize-1)/2);;
-    int z = (id / (gridSize * gridSize)) - ((gridSize-1)/2);;
+    int y = ((id / gridSize) % gridSize) - ((gridSize-1)/2);
+    int z = (id / (gridSize * gridSize)) - ((gridSize-1)/2);
 
-    float3 offset = float3(x, y, z);
+    float3 offset = float3(vox.position.x- ((gridSize-1)/2), vox.position.y - ((gridSize-1)/2), vox.position.z - ((gridSize-1)/2));
+    
     float3 basePos = offset*spacing;
     float4 color = float4(float(id % 3 == 0), float(id % 3 == 1), float(id % 3 == 2), 1.0);
-    
+    color = vox.color;
+        
     float3 v[8];
     v[0] = float3(-size * 0.5, -size * 0.5, size * 0.5);
     v[1] = float3(size * 0.5, -size * 0.5, size * 0.5);

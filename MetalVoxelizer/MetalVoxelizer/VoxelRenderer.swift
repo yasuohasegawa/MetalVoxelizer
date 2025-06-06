@@ -8,6 +8,13 @@
 import SwiftUI
 import MetalKit
 
+struct Voxel {
+    var position: SIMD3<Int32>   // 12 bytes
+    var active: UInt8            // 1 byte
+    var padding: (UInt8, UInt8, UInt8) = (0, 0, 0)  // 3 bytes padding to align to 4 bytes. we won't use this. We just need them to keep 32 bytes format.
+    var color: SIMD4<Float>      // 16 bytes
+}
+
 struct Vertex {
     var position: SIMD3<Float>
     var normal: SIMD3<Float>
@@ -24,7 +31,7 @@ struct Uniforms {
 }
 
 class VoxelRenderer: NSObject, MTKViewDelegate {
-    let gridSize = 100
+    let gridSize = 64
     let verticesPerQuad = 24
     let indicesPerQuad = 36
     let voxelSize:Float = 0.01
@@ -37,6 +44,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     
     var vertexBuffer: MTLBuffer!
     var indexBuffer: MTLBuffer!
+    var voxelBuffer: MTLBuffer!
     var paramsBuffer: MTLBuffer!
     var indexCount: Int = 0
     var depthTexture: MTLTexture!
@@ -96,6 +104,30 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         mtkView.delegate = self
     }
 
+    func createDummyVoxels(gridSize: Int) -> [Voxel] {
+        var voxels = [Voxel]()
+        voxels.reserveCapacity(gridSize * gridSize * gridSize)
+        
+        for z in 0..<gridSize {
+            for y in 0..<gridSize {
+                for x in 0..<gridSize {
+                    let position = SIMD3<Int32>(Int32(x), Int32(y), Int32(z))
+                    
+                    let random = Float.random(in: 0..<1)
+                    let isActive: UInt8 = (random <= 0.1) ? 1 : 0
+                    
+                    let color: SIMD4<Float> = isActive == 1 ?
+                    SIMD4<Float>(Float.random(in: 0.3..<1), Float.random(in: 0.3..<1), Float.random(in: 0.3..<1), 1) : SIMD4<Float>(0.3, 0.3, 0.3, 0)
+                    
+                    let voxel = Voxel(position: position, active: isActive, padding: (0, 0, 0), color: color)
+                    voxels.append(voxel)
+                }
+            }
+        }
+        
+        return voxels
+    }
+    
     func createDepthTexture(device: MTLDevice, width: Int, height: Int) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float,
@@ -122,6 +154,11 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         vertexBuffer = device.makeBuffer(length: MemoryLayout<Vertex>.stride * maxVertices, options: .storageModePrivate)
         indexBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride * maxIndices, options: .storageModePrivate)
         
+        let voxels = createDummyVoxels(gridSize: gridSize)
+
+        voxelBuffer = device.makeBuffer(bytes: voxels,
+                                            length: MemoryLayout<Voxel>.stride * voxels.count,
+                                            options: .storageModeShared)
         
         paramsBuffer = device.makeBuffer(bytes: &params,
                                              length: MemoryLayout<VoxelParams>.stride,
@@ -133,10 +170,8 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         computeEncoder.setComputePipelineState(computePipeline)
         computeEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
         computeEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
-        computeEncoder.setBuffer(paramsBuffer, offset: 0, index: 2)
-
-//        let threads = MTLSize(width: voxelCount, height: 1, depth: 1)
-//        computeEncoder.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        computeEncoder.setBuffer(voxelBuffer, offset: 0, index: 2)
+        computeEncoder.setBuffer(paramsBuffer, offset: 0, index: 3)
 
         let threadsPerGroup = MTLSize(width: 64, height: 1, depth: 1)
         let threadgroups = MTLSize(width: (voxelCount + 63) / 64, height: 1, depth: 1)
@@ -185,7 +220,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         let modelMatrix = Matrix.makeRotationYMatrix(angle: elapsed*Float(speed))
         let projection = Matrix.perspectiveFovRH(fovY: fov, aspect: aspect, nearZ: near, farZ: far)
         let view = Matrix.lookAt(
-            eye: SIMD3<Float>(0, 0, 3.5),
+            eye: SIMD3<Float>(0, 0, 3.0),
             center: SIMD3<Float>(0, 0, 0),
             up: SIMD3<Float>(0, 1, 0)
         )
@@ -199,7 +234,8 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         encoder.setDepthStencilState(depthStencilState)
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
-        encoder.setVertexBuffer(paramsBuffer, offset: 0, index: 2)
+        encoder.setVertexBuffer(voxelBuffer, offset: 0, index: 2)
+        encoder.setVertexBuffer(paramsBuffer, offset: 0, index: 3)
         encoder.drawIndexedPrimitives(type: .triangle,
                                       indexCount: indexCount,
                                       indexType: .uint32,
