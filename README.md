@@ -11,4 +11,4 @@ Compute Shader based voxel rendering
   - [ ] Raycasting to detect clicked voxel
   - [ ] Highlight selected voxel (wireframe or colored box)
   - [ ] Support placing/removing voxels
-  - [ ] Optional: Multi-selection with drag or shift+click
+  - [ ] Optional: Multi-selection with drag
