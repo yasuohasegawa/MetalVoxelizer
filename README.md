@@ -4,7 +4,7 @@ WIP<br>
 Compute Shader based voxel rendering
 
 ## TODO
-- [ ] Face culling and mesh optimization
+- [x] Face culling and mesh optimization
 - [ ] Implement buffer splitting to handle the size limitation
 - [ ] Add camera controls for voxel navigation
 - [ ] Add voxel selection feature:
