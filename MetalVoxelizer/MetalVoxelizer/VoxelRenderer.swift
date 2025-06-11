@@ -26,12 +26,16 @@ struct VoxelParams {
     var gridSize:Int32
 }
 
+struct ChunkParams {
+    var chunkOffset: UInt32
+}
+
 struct Uniforms {
     var viewProjectionMatrix: matrix_float4x4
 }
 
 class VoxelRenderer: NSObject, MTKViewDelegate {
-    let gridSize = 64
+    let gridSize = 128
     let verticesPerQuad = 24
     let indicesPerQuad = 36
     let voxelSize:Float = 0.01
@@ -45,6 +49,12 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     var vertexBuffer: MTLBuffer!
     var indexBuffer: MTLBuffer!
     var voxelBuffer: MTLBuffer!
+    
+    let maxChunkSize = 60_000
+    var vertexBuffers: [MTLBuffer] = []
+    var indexBuffers: [MTLBuffer] = []
+    var indexCounts: [Int] = []
+    
     var paramsBuffer: MTLBuffer!
     var indexCount: Int = 0
     var depthTexture: MTLTexture!
@@ -142,46 +152,73 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     
     func generateVoxelMesh() {
         let voxelCount = gridSize * gridSize * gridSize
-
-        let maxVertices = voxelCount * verticesPerQuad
-        let maxIndices = voxelCount * indicesPerQuad
-
-        var params = VoxelParams(
-            voxelSize: voxelSize,
-            gridSize: Int32(gridSize)
-        )
-        
-        vertexBuffer = device.makeBuffer(length: MemoryLayout<Vertex>.stride * maxVertices, options: .storageModePrivate)
-        indexBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride * maxIndices, options: .storageModePrivate)
-        
         let voxels = createDummyVoxels(gridSize: gridSize)
 
-        voxelBuffer = device.makeBuffer(bytes: voxels,
-                                            length: MemoryLayout<Voxel>.stride * voxels.count,
-                                            options: .storageModeShared)
-        
-        paramsBuffer = device.makeBuffer(bytes: &params,
-                                             length: MemoryLayout<VoxelParams>.stride,
-                                             options: [])
-        
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        let maxQuadsPerChunk = maxChunkSize / indicesPerQuad
+        let totalQuads = voxelCount
+        let totalChunks = (totalQuads + maxQuadsPerChunk - 1) / maxQuadsPerChunk
 
-        computeEncoder.setComputePipelineState(computePipeline)
-        computeEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
-        computeEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
-        computeEncoder.setBuffer(voxelBuffer, offset: 0, index: 2)
-        computeEncoder.setBuffer(paramsBuffer, offset: 0, index: 3)
+        var params = VoxelParams(voxelSize: voxelSize, gridSize: Int32(gridSize))
 
-        let threadsPerGroup = MTLSize(width: 64, height: 1, depth: 1)
-        let threadgroups = MTLSize(width: (voxelCount + 63) / 64, height: 1, depth: 1)
-        computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-        
-        computeEncoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+        voxelBuffer = device.makeBuffer(
+            bytes: voxels,
+            length: MemoryLayout<Voxel>.stride * voxels.count,
+            options: .storageModeShared
+        )
 
-        indexCount = maxIndices
+        paramsBuffer = device.makeBuffer(
+            bytes: &params,
+            length: MemoryLayout<VoxelParams>.stride,
+            options: []
+        )
+
+        vertexBuffers.removeAll()
+        indexBuffers.removeAll()
+        indexCounts.removeAll()
+
+        for chunkIndex in 0..<totalChunks {
+            let startQuad = chunkIndex * maxQuadsPerChunk
+            let quadCount = min(maxQuadsPerChunk, totalQuads - startQuad)
+            let vertexCount = quadCount * verticesPerQuad
+            let indexCount = quadCount * indicesPerQuad
+
+            guard let vertexBuffer = device.makeBuffer(
+                    length: MemoryLayout<Vertex>.stride * vertexCount,
+                    options: .storageModePrivate),
+                  let indexBuffer = device.makeBuffer(
+                    length: MemoryLayout<UInt32>.stride * indexCount,
+                    options: .storageModePrivate),
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let computeEncoder = commandBuffer.makeComputeCommandEncoder()
+            else { continue }
+
+            computeEncoder.setComputePipelineState(computePipeline)
+            computeEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(voxelBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(paramsBuffer, offset: 0, index: 3)
+
+            // pass offset of current chunk in voxels if compute shader supports it
+            let chunkOffset = UInt32(startQuad)
+            var chunkParams = ChunkParams(chunkOffset: chunkOffset)
+            let chunkParamsBuffer = device.makeBuffer(bytes: &chunkParams,
+                                                      length: MemoryLayout<ChunkParams>.stride,
+                                                      options: [])
+
+            computeEncoder.setBuffer(chunkParamsBuffer, offset: 0, index: 4)
+            
+            let threadsPerGroup = MTLSize(width: 64, height: 1, depth: 1)
+            let threadgroups = MTLSize(width: (quadCount + 63) / 64, height: 1, depth: 1)
+
+            computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+            computeEncoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+
+            vertexBuffers.append(vertexBuffer)
+            indexBuffers.append(indexBuffer)
+            indexCounts.append(indexCount)
+        }
     }
     
     func draw(in view: MTKView) {
@@ -232,19 +269,22 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         
         encoder.setRenderPipelineState(renderPipeline)
         encoder.setDepthStencilState(depthStencilState)
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
-        encoder.setVertexBuffer(voxelBuffer, offset: 0, index: 2)
-        encoder.setVertexBuffer(paramsBuffer, offset: 0, index: 3)
-        encoder.drawIndexedPrimitives(type: .triangle,
-                                      indexCount: indexCount,
-                                      indexType: .uint32,
-                                      indexBuffer: indexBuffer,
-                                      indexBufferOffset: 0)
-        
         encoder.setCullMode(.back)
         encoder.setFrontFacing(.counterClockwise)
-        
+
+        for i in 0..<vertexBuffers.count {
+            encoder.setVertexBuffer(vertexBuffers[i], offset: 0, index: 0)
+            encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
+            encoder.setVertexBuffer(voxelBuffer, offset: 0, index: 2)
+            encoder.setVertexBuffer(paramsBuffer, offset: 0, index: 3)
+
+            encoder.drawIndexedPrimitives(type: .triangle,
+                                          indexCount: indexCounts[i],
+                                          indexType: .uint32,
+                                          indexBuffer: indexBuffers[i],
+                                          indexBufferOffset: 0)
+        }
+
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()

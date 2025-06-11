@@ -26,6 +26,10 @@ struct VoxelParams {
     int gridSize;
 };
 
+struct ChunkParams {
+    uint chunkOffset;   // The offset in number of voxels
+};
+
 inline bool isVoxelActive(device Voxel *voxelBuffer, int3 pos, int gridSize) {
     if (pos.x < 0 || pos.y < 0 || pos.z < 0 || pos.x >= gridSize || pos.y >= gridSize || pos.z >= gridSize)
         return false;
@@ -38,9 +42,15 @@ kernel void generateGeometry(
     device uint *indexBuffer [[ buffer(1) ]],
     device Voxel *voxelBuffer [[ buffer(2) ]],
     device VoxelParams *params [[ buffer(3) ]],
+    device ChunkParams *chunkParams  [[ buffer(4) ]],
     uint id [[ thread_position_in_grid ]]) {
     
-    Voxel vox = voxelBuffer[id];
+    uint gid = id + chunkParams->chunkOffset;
+    if (gid >= uint(params->gridSize * params->gridSize * params->gridSize)) {
+        return;
+    }
+    
+    Voxel vox = voxelBuffer[gid];
     if(vox.active == 0)return;
     
     float size = params->voxelSize;
@@ -53,11 +63,8 @@ kernel void generateGeometry(
 //    int z = (id / (gridSize * gridSize)) - ((gridSize-1)/2);
     
     float3 offset = float3(vox.position.x- ((gridSize-1)/2), vox.position.y - ((gridSize-1)/2), vox.position.z - ((gridSize-1)/2));
-    
     float3 basePos = offset*spacing;
-    float4 color = float4(float(id % 3 == 0), float(id % 3 == 1), float(id % 3 == 2), 1.0);
-    color = vox.color;
-        
+    float4 color = vox.color;
     
     int3 directions[6] = {
         int3( 0, -1,  0), // bottom
