@@ -51,6 +51,11 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     
     var startTime: CFTimeInterval = CACurrentMediaTime()
     
+    private var lastPanLocation: CGPoint?
+    private var cameraDistance: Float = 3.0
+    private var cameraTarget = SIMD3<Float>(0, 0, 0)
+    private var orientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0,1,0))
+    
     init?(mtkView: MTKView) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue() else { return nil }
@@ -101,6 +106,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         super.init()
         
         generateVoxelMesh()
+        setupGestures(view: mtkView)
         mtkView.delegate = self
     }
 
@@ -210,22 +216,44 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
 
         let aspect = Float(view.drawableSize.width / view.drawableSize.height)
         let fov: Float = .pi / 4
-        let near: Float = 0.1
+        let near: Float = 0.01
         let far: Float = 100.0
 
-        let currentTime = CACurrentMediaTime()
-        let elapsed = Float(currentTime - startTime)
-        let speed = 0.5
+//        let currentTime = CACurrentMediaTime()
+//        let elapsed = Float(currentTime - startTime)
+//        let speed = 0.5
+//        let modelMatrix = Matrix.makeRotationYMatrix(angle: elapsed*Float(speed))
         
-        let modelMatrix = Matrix.makeRotationYMatrix(angle: elapsed*Float(speed))
+        // old camera logic
+//        let modelMatrix = currentModelTranslate * currentModelRotation * currentModelScale
+//        let projection = Matrix.perspectiveFovRH(fovY: fov, aspect: aspect, nearZ: near, farZ: far)
+//        let view = Matrix.lookAt(
+//            eye: SIMD3<Float>(0, 0, 3.0),
+//            center: SIMD3<Float>(0, 0, 0),
+//            up: SIMD3<Float>(0, 1, 0)
+//        )
+//        
+//        let viewProj = projection * view * modelMatrix
+        
+        let forward = simd_act(orientation, SIMD3<Float>(0,0,-1))
+        let up      = simd_act(orientation, SIMD3<Float>(0,1,0))
+        let right   = simd_cross(forward, up)
+
+        let eye = cameraTarget - forward * cameraDistance
+
+        let r = SIMD4<Float>( right.x, up.x, -forward.x, 0 )
+        let u = SIMD4<Float>( right.y, up.y, -forward.y, 0 )
+        let f = SIMD4<Float>( right.z, up.z, -forward.z, 0 )
+        let p = SIMD4<Float>(-simd_dot(right, eye),
+                             -simd_dot(up, eye),
+                              simd_dot(forward, eye), 1)
+
+        let viewMatrix = float4x4(columns:(r,u,f,p))
+
         let projection = Matrix.perspectiveFovRH(fovY: fov, aspect: aspect, nearZ: near, farZ: far)
-        let view = Matrix.lookAt(
-            eye: SIMD3<Float>(0, 0, 3.0),
-            center: SIMD3<Float>(0, 0, 0),
-            up: SIMD3<Float>(0, 1, 0)
-        )
-        
-        let viewProj = projection * view * modelMatrix
+        //let view = Matrix.lookAt(eye: eye, center: cameraTarget, up: SIMD3<Float>(0,1,0))
+        let modelMatrix = matrix_identity_float4x4
+        let viewProj = projection * viewMatrix * modelMatrix
         
         var uniforms = Uniforms(viewProjectionMatrix: viewProj)
         let uniformBuffer = device.makeBuffer(bytes: &uniforms, length: MemoryLayout<Uniforms>.stride, options: [])
@@ -253,6 +281,68 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    
+    private func setupGestures(view: MTKView) {
+        // One-finger pan for rotation
+        let oneFingerPanGesture = UIPanGestureRecognizer(target: self, action: #selector(handleOneFingerPan(_:)))
+        oneFingerPanGesture.maximumNumberOfTouches = 1
+        view.addGestureRecognizer(oneFingerPanGesture)
+
+        // Two-finger pan for translation
+        let twoFingerPanGesture = UIPanGestureRecognizer(target: self, action: #selector(handleTwoFingerPan(_:)))
+        twoFingerPanGesture.minimumNumberOfTouches = 2
+        view.addGestureRecognizer(twoFingerPanGesture)
+
+        // Pinch for scaling
+        let pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        view.addGestureRecognizer(pinchGesture)
+    }
+    
+    @objc private func handleOneFingerPan(_ gesture: UIPanGestureRecognizer) {
+        if gesture.state == .began {
+            lastPanLocation = gesture.location(in: gesture.view)
+        } else if gesture.state == .changed {
+            guard let last = lastPanLocation else { return }
+            let currentLocation = gesture.location(in: gesture.view)
+
+            let deltaX = Float(currentLocation.x - last.x) * 0.01
+            let deltaY = Float(currentLocation.y - last.y) * 0.01
+            let rotSpeed: Float = 0.5
+            let yawQuat = simd_quatf(angle: -deltaX * rotSpeed, axis: SIMD3<Float>(0,1,0))
+            let rightAxis = simd_act(orientation, SIMD3<Float>(1,0,0))
+            let pitchQuat = simd_quatf(angle: -deltaY * rotSpeed, axis: rightAxis)
+
+            orientation = yawQuat * pitchQuat * orientation
+            
+            lastPanLocation = currentLocation
+        } else if gesture.state == .ended || gesture.state == .cancelled {
+            lastPanLocation = nil
+        }
+    }
+    
+    @objc private func handleTwoFingerPan(_ gesture: UIPanGestureRecognizer) {
+        if gesture.state == .changed {
+            let translation = gesture.translation(in: gesture.view)
+            
+            let panSpeed: Float = 0.002 * cameraDistance
+            let forward = simd_act(orientation, SIMD3<Float>(0,0,-1))
+            let up      = simd_act(orientation, SIMD3<Float>(0,1,0))
+            let right   = simd_cross(forward, up)
+
+            cameraTarget -= right * Float(translation.x) * panSpeed
+            cameraTarget += up    * Float(translation.y) * panSpeed
+
+            gesture.setTranslation(.zero, in: gesture.view)
+        }
+    }
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        if gesture.state == .changed {
+            cameraDistance /= Float(gesture.scale)
+            cameraDistance = max(0.1, min(cameraDistance, 50))
+            gesture.scale = 1.0
+        }
+    }
 }
 
 
