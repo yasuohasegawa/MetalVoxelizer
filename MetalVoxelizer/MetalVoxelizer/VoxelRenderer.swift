@@ -32,6 +32,10 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     let gridSize = 128
     let voxelSize: Float = 0.01
     
+    // Buffer splitting configuration
+    let maxBufferSize = 200 * 1024 * 1024  // 200 MB per buffer (safe limit)
+    let maxVoxelsPerChunk: Int
+    
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let compactionPipeline: MTLComputePipelineState
@@ -40,8 +44,12 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     let linePipeline: MTLRenderPipelineState
     let depthStencilState: MTLDepthStencilState
     
-    var vertexBuffer: MTLBuffer!
-    var indexBuffer: MTLBuffer!
+    // Split buffers for handling large datasets
+    var vertexBuffers: [MTLBuffer] = []
+    var indexBuffers: [MTLBuffer] = []
+    var indexCounts: [Int] = []
+    var chunkOffsets: [Int] = []  // Starting voxel index for each chunk
+    
     var voxelBuffer: MTLBuffer!
     var paramsBuffer: MTLBuffer!
     var activeVoxelBuffer: MTLBuffer!
@@ -56,7 +64,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     var axisIndexCount: Int = 0
     var gridIndexCount: Int = 0
     
-    var actualIndexCount: Int = 0
+    var totalIndexCount: Int = 0
     
     private var lastPanLocation: CGPoint?
     private var cameraDistance: Float = 3.0
@@ -69,6 +77,16 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
 
         self.device = device
         self.commandQueue = commandQueue
+        
+        // Calculate max voxels per chunk based on buffer size limit
+        // Each active voxel generates 24 vertices and 36 indices
+        let vertexSize = MemoryLayout<Vertex>.stride * 24
+        let indexSize = MemoryLayout<UInt32>.stride * 36
+        let totalSizePerVoxel = vertexSize + indexSize
+        self.maxVoxelsPerChunk = maxBufferSize / totalSizePerVoxel
+        
+        print("Max voxels per chunk: \(maxVoxelsPerChunk)")
+        
         mtkView.device = device
 
         let library = device.makeDefaultLibrary()!
@@ -401,68 +419,98 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         let compactedCount = Int(countPtr.pointee)
         print("Compacted to \(compactedCount) active voxels")
         
-        // NOW allocate buffers based on ACTUAL active count
-        let actualMaxVertices = compactedCount * 24
-        let actualMaxIndices = compactedCount * 36
+        // Calculate number of chunks needed
+        let numChunks = (compactedCount + maxVoxelsPerChunk - 1) / maxVoxelsPerChunk
+        print("Splitting into \(numChunks) chunk(s)")
         
-        let vertexBufferSize = MemoryLayout<Vertex>.stride * actualMaxVertices
-        let indexBufferSize = MemoryLayout<UInt32>.stride * actualMaxIndices
+        // Clear previous buffers
+        vertexBuffers.removeAll()
+        indexBuffers.removeAll()
+        indexCounts.removeAll()
+        chunkOffsets.removeAll()
+        totalIndexCount = 0
         
-        print("Allocating vertex buffer: \(vertexBufferSize / 1024 / 1024) MB")
-        print("Allocating index buffer: \(indexBufferSize / 1024 / 1024) MB")
-        
-        // Check if allocation would exceed limits
-        let totalSize = vertexBufferSize + indexBufferSize
-        if totalSize > 256 * 1024 * 1024 { // 256 MB safety limit
-            print("WARNING: Buffer allocation would exceed safe limit!")
-            print("Consider reducing grid size or voxel density")
-        }
-        
-        // Allocate exact size needed for active voxels
-        vertexBuffer = device.makeBuffer(
-            length: vertexBufferSize,
-            options: .storageModePrivate)
-        
-        indexBuffer = device.makeBuffer(
-            length: indexBufferSize,
-            options: .storageModePrivate)
-        
-        guard vertexBuffer != nil && indexBuffer != nil else {
-            print("ERROR: Failed to allocate buffers!")
-            print("Try reducing grid size or voxel density")
-            return
-        }
-        
-        print("Buffers allocated successfully")
-        
-        // Step 2: Generate geometry
-        guard let commandBuffer2 = commandQueue.makeCommandBuffer() else { return }
-        
-        if let geometryEncoder = commandBuffer2.makeComputeCommandEncoder() {
-            geometryEncoder.setComputePipelineState(geometryPipeline)
-            geometryEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
-            geometryEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
-            geometryEncoder.setBuffer(voxelBuffer, offset: 0, index: 2)
-            geometryEncoder.setBuffer(paramsBuffer, offset: 0, index: 3)
-            geometryEncoder.setBuffer(activeVoxelBuffer, offset: 0, index: 4)
-            geometryEncoder.setBuffer(activeCountBuffer, offset: 0, index: 5)
+        // Create buffers and generate geometry for each chunk
+        for chunkIndex in 0..<numChunks {
+            let startVoxel = chunkIndex * maxVoxelsPerChunk
+            let endVoxel = min(startVoxel + maxVoxelsPerChunk, compactedCount)
+            let chunkSize = endVoxel - startVoxel
             
-            let threadsPerGroup = MTLSize(width: 64, height: 1, depth: 1)
-            let threadgroups = MTLSize(width: (compactedCount + 63) / 64, height: 1, depth: 1)
-            geometryEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
-            geometryEncoder.endEncoding()
+            print("\nProcessing chunk \(chunkIndex + 1)/\(numChunks): voxels \(startVoxel)..\(endVoxel-1) (count: \(chunkSize))")
+            
+            // Allocate buffers for this chunk
+            let vertexBufferSize = MemoryLayout<Vertex>.stride * chunkSize * 24
+            let indexBufferSize = MemoryLayout<UInt32>.stride * chunkSize * 36
+            
+            print("  Vertex buffer: \(vertexBufferSize / 1024 / 1024) MB")
+            print("  Index buffer: \(indexBufferSize / 1024 / 1024) MB")
+            
+            guard let vertexBuffer = device.makeBuffer(
+                length: vertexBufferSize,
+                options: .storageModePrivate),
+                  let indexBuffer = device.makeBuffer(
+                length: indexBufferSize,
+                options: .storageModePrivate) else {
+                print("ERROR: Failed to allocate buffers for chunk \(chunkIndex)!")
+                continue
+            }
+            
+            // Generate geometry for this chunk
+            guard let commandBuffer2 = commandQueue.makeCommandBuffer() else { continue }
+            
+            if let geometryEncoder = commandBuffer2.makeComputeCommandEncoder() {
+                geometryEncoder.setComputePipelineState(geometryPipeline)
+                geometryEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
+                geometryEncoder.setBuffer(indexBuffer, offset: 0, index: 1)
+                geometryEncoder.setBuffer(voxelBuffer, offset: 0, index: 2)
+                geometryEncoder.setBuffer(paramsBuffer, offset: 0, index: 3)
+                
+                // Create a temporary active voxel buffer for this chunk
+                let activeVoxelPtr = activeVoxelBuffer.contents().bindMemory(to: UInt32.self, capacity: compactedCount)
+                let chunkActiveVoxels = Array(UnsafeBufferPointer(start: activeVoxelPtr.advanced(by: startVoxel), count: chunkSize))
+                
+                guard let chunkActiveBuffer = device.makeBuffer(
+                    bytes: chunkActiveVoxels,
+                    length: MemoryLayout<UInt32>.stride * chunkSize,
+                    options: .storageModeShared) else { continue }
+                
+                var chunkCount = UInt32(chunkSize)
+                guard let chunkCountBuffer = device.makeBuffer(
+                    bytes: &chunkCount,
+                    length: MemoryLayout<UInt32>.stride,
+                    options: .storageModeShared) else { continue }
+                
+                geometryEncoder.setBuffer(chunkActiveBuffer, offset: 0, index: 4)
+                geometryEncoder.setBuffer(chunkCountBuffer, offset: 0, index: 5)
+                
+                let threadsPerGroup = MTLSize(width: 64, height: 1, depth: 1)
+                let threadgroups = MTLSize(width: (chunkSize + 63) / 64, height: 1, depth: 1)
+                geometryEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerGroup)
+                geometryEncoder.endEncoding()
+            }
+            
+            commandBuffer2.commit()
+            commandBuffer2.waitUntilCompleted()
+            
+            let chunkIndexCount = chunkSize * 36
+            
+            vertexBuffers.append(vertexBuffer)
+            indexBuffers.append(indexBuffer)
+            indexCounts.append(chunkIndexCount)
+            chunkOffsets.append(startVoxel)
+            totalIndexCount += chunkIndexCount
+            
+            print("  Generated \(chunkIndexCount) indices for chunk")
         }
         
-        commandBuffer2.commit()
-        commandBuffer2.waitUntilCompleted()
-        
-        actualIndexCount = compactedCount * 36
-        print("Generated \(actualIndexCount) indices")
-        print("=== Mesh Generation Complete ===\n")
+        print("\n=== Mesh Generation Complete ===")
+        print("Total chunks: \(numChunks)")
+        print("Total indices: \(totalIndexCount)")
+        print("====================================\n")
     }
     
     func draw(in view: MTKView) {
-        guard actualIndexCount > 0 else { return }
+        guard totalIndexCount > 0 else { return }
         
         let descriptor = view.currentRenderPassDescriptor
         guard let descriptor = descriptor else { return }
@@ -513,20 +561,22 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
                                              length: MemoryLayout<Uniforms>.stride,
                                              options: [])
         
-        // draw voxels
+        // Draw voxels - iterate through all chunks
         encoder.setRenderPipelineState(renderPipeline)
         encoder.setDepthStencilState(depthStencilState)
         encoder.setCullMode(.back)
         encoder.setFrontFacing(.counterClockwise)
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
         encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
         
-        encoder.drawIndexedPrimitives(
-            type: .triangle,
-            indexCount: actualIndexCount,
-            indexType: .uint32,
-            indexBuffer: indexBuffer,
-            indexBufferOffset: 0)
+        for i in 0..<vertexBuffers.count {
+            encoder.setVertexBuffer(vertexBuffers[i], offset: 0, index: 0)
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: indexCounts[i],
+                indexType: .uint32,
+                indexBuffer: indexBuffers[i],
+                indexBufferOffset: 0)
+        }
         
         // draw grids
         encoder.setRenderPipelineState(linePipeline)
