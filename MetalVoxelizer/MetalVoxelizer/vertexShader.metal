@@ -24,9 +24,8 @@ struct VertexOut {
     float4 color;
 };
 
-
 vertex VertexOut vertex_main(uint vertexID [[vertex_id]],
-                             device Vertex* vertexArray [[buffer(0)]],
+                             constant Vertex* vertexArray [[buffer(0)]],
                              constant Uniforms& uniforms [[buffer(1)]]) {
     VertexOut out;
     Vertex v = vertexArray[vertexID];
