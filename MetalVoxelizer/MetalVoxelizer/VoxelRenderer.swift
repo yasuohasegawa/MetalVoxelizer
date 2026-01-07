@@ -28,6 +28,148 @@ struct Uniforms {
     var viewProjectionMatrix: matrix_float4x4
 }
 
+// Frustum plane for culling
+struct Plane {
+    var normal: SIMD3<Float>
+    var distance: Float
+    
+    init(normal: SIMD3<Float>, distance: Float) {
+        self.normal = normalize(normal)
+        self.distance = distance
+    }
+    
+    // Distance from point to plane (positive = in front)
+    func distanceToPoint(_ point: SIMD3<Float>) -> Float {
+        return simd_dot(normal, point) + distance
+    }
+}
+
+// Axis-aligned bounding box
+struct AABB {
+    var min: SIMD3<Float>
+    var max: SIMD3<Float>
+    
+    var center: SIMD3<Float> {
+        return (min + max) * 0.5
+    }
+    
+    var extent: SIMD3<Float> {
+        return (max - min) * 0.5
+    }
+    
+    // Get all 8 corners of the bounding box
+    func getCorners() -> [SIMD3<Float>] {
+        return [
+            SIMD3<Float>(min.x, min.y, min.z),
+            SIMD3<Float>(max.x, min.y, min.z),
+            SIMD3<Float>(min.x, max.y, min.z),
+            SIMD3<Float>(max.x, max.y, min.z),
+            SIMD3<Float>(min.x, min.y, max.z),
+            SIMD3<Float>(max.x, min.y, max.z),
+            SIMD3<Float>(min.x, max.y, max.z),
+            SIMD3<Float>(max.x, max.y, max.z)
+        ]
+    }
+}
+
+// Frustum with 6 planes
+struct Frustum {
+    var planes: [Plane] = []
+    
+    init(viewProjectionMatrix: matrix_float4x4) {
+        planes.reserveCapacity(6)
+        
+        // Extract frustum planes from view-projection matrix
+        // Metal uses column-major matrices: matrix[column][row]
+        let m = viewProjectionMatrix
+        
+        // Left plane: m3 + m0
+        planes.append(Plane(
+            normal: SIMD3<Float>(
+                m[3][0] + m[0][0],
+                m[3][1] + m[0][1],
+                m[3][2] + m[0][2]
+            ),
+            distance: m[3][3] + m[0][3]
+        ))
+        
+        // Right plane: m3 - m0
+        planes.append(Plane(
+            normal: SIMD3<Float>(
+                m[3][0] - m[0][0],
+                m[3][1] - m[0][1],
+                m[3][2] - m[0][2]
+            ),
+            distance: m[3][3] - m[0][3]
+        ))
+        
+        // Bottom plane: m3 + m1
+        planes.append(Plane(
+            normal: SIMD3<Float>(
+                m[3][0] + m[1][0],
+                m[3][1] + m[1][1],
+                m[3][2] + m[1][2]
+            ),
+            distance: m[3][3] + m[1][3]
+        ))
+        
+        // Top plane: m3 - m1
+        planes.append(Plane(
+            normal: SIMD3<Float>(
+                m[3][0] - m[1][0],
+                m[3][1] - m[1][1],
+                m[3][2] - m[1][2]
+            ),
+            distance: m[3][3] - m[1][3]
+        ))
+        
+        // Near plane: m3 + m2
+        planes.append(Plane(
+            normal: SIMD3<Float>(
+                m[3][0] + m[2][0],
+                m[3][1] + m[2][1],
+                m[3][2] + m[2][2]
+            ),
+            distance: m[3][3] + m[2][3]
+        ))
+        
+        // Far plane: m3 - m2
+        planes.append(Plane(
+            normal: SIMD3<Float>(
+                m[3][0] - m[2][0],
+                m[3][1] - m[2][1],
+                m[3][2] - m[2][2]
+            ),
+            distance: m[3][3] - m[2][3]
+        ))
+    }
+    
+    // Test if AABB is inside or intersecting frustum
+    func intersects(aabb: AABB) -> Bool {
+        // Add padding to make culling more conservative (prevents false culling)
+        let padding: Float = 0.5  // Extra margin to prevent edge cases
+        let expandedMin = aabb.min - SIMD3<Float>(repeating: padding)
+        let expandedMax = aabb.max + SIMD3<Float>(repeating: padding)
+        
+        // Test against all 6 planes
+        for plane in planes {
+            // Find the positive vertex (corner furthest along plane normal)
+            var positiveVertex = expandedMin
+            if plane.normal.x >= 0 { positiveVertex.x = expandedMax.x }
+            if plane.normal.y >= 0 { positiveVertex.y = expandedMax.y }
+            if plane.normal.z >= 0 { positiveVertex.z = expandedMax.z }
+            
+            // If positive vertex is behind plane, AABB is completely outside
+            if plane.distanceToPoint(positiveVertex) < 0 {
+                return false
+            }
+        }
+        
+        // AABB is inside or intersecting frustum
+        return true
+    }
+}
+
 class VoxelRenderer: NSObject, MTKViewDelegate {
     let gridSize = 128
     let voxelSize: Float = 0.01
@@ -35,6 +177,8 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     // Buffer splitting configuration
     let maxBufferSize = 200 * 1024 * 1024  // 200 MB per buffer (safe limit)
     let maxVoxelsPerChunk: Int
+    let enableFrustumCulling = true  // Set to true once culling is verified working
+    let debugFrustumCulling = false  // Print detailed culling info
     
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
@@ -49,6 +193,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     var indexBuffers: [MTLBuffer] = []
     var indexCounts: [Int] = []
     var chunkOffsets: [Int] = []  // Starting voxel index for each chunk
+    var chunkBounds: [AABB] = []  // Bounding box for each chunk
     
     var voxelBuffer: MTLBuffer!
     var paramsBuffer: MTLBuffer!
@@ -363,6 +508,56 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         return device.makeTexture(descriptor: desc)
     }
     
+    // Calculate bounding box for a chunk of voxels
+    func calculateChunkBounds(voxelIndices: [UInt32]) -> AABB {
+        guard !voxelIndices.isEmpty else {
+            return AABB(min: SIMD3<Float>(0, 0, 0), max: SIMD3<Float>(0, 0, 0))
+        }
+        
+        let spacing = voxelSize * 1.1
+        let halfGrid = Float(gridSize - 1) / 2.0
+        
+        var minPos = SIMD3<Float>(Float.infinity, Float.infinity, Float.infinity)
+        var maxPos = SIMD3<Float>(-Float.infinity, -Float.infinity, -Float.infinity)
+        
+        let voxelPtr = voxelBuffer.contents().bindMemory(to: Voxel.self, capacity: gridSize * gridSize * gridSize)
+        
+        for voxelIndex in voxelIndices {
+            let voxel = voxelPtr[Int(voxelIndex)]
+            let pos = voxel.position
+            
+            // Calculate world position (matching shader logic)
+            let worldPos = SIMD3<Float>(
+                (Float(pos.x) - halfGrid) * spacing,
+                (Float(pos.y) - halfGrid) * spacing,
+                (Float(pos.z) - halfGrid) * spacing
+            )
+            
+            // Expand to include voxel size
+            let halfVoxel = voxelSize * 0.5
+            minPos = simd_min(minPos, worldPos - SIMD3<Float>(repeating: halfVoxel))
+            maxPos = simd_max(maxPos, worldPos + SIMD3<Float>(repeating: halfVoxel))
+        }
+        
+        return AABB(min: minPos, max: maxPos)
+    }
+    
+    // Check if a chunk is visible in the frustum
+    func isChunkVisible(chunkIndex: Int, frustum: Frustum, cameraPosition: SIMD3<Float>) -> Bool {
+        guard chunkIndex < chunkBounds.count else { return true }
+        
+        let bounds = chunkBounds[chunkIndex]
+        
+        // Safety check: If camera is very close to chunk, always render it
+        let distanceToCenter = simd_length(cameraPosition - bounds.center)
+        if distanceToCenter < 2.0 {  // Within 2 units, always render
+            return true
+        }
+        
+        // Do frustum test
+        return frustum.intersects(aabb: bounds)
+    }
+    
     func generateVoxelMesh() {
         let voxelCount = gridSize * gridSize * gridSize
         
@@ -428,6 +623,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         indexBuffers.removeAll()
         indexCounts.removeAll()
         chunkOffsets.removeAll()
+        chunkBounds.removeAll()
         totalIndexCount = 0
         
         // Create buffers and generate geometry for each chunk
@@ -457,7 +653,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
             
             // Generate geometry for this chunk
             guard let commandBuffer2 = commandQueue.makeCommandBuffer() else { continue }
-            
+            var chunkActiveVoxels = Array<UInt32>()
             if let geometryEncoder = commandBuffer2.makeComputeCommandEncoder() {
                 geometryEncoder.setComputePipelineState(geometryPipeline)
                 geometryEncoder.setBuffer(vertexBuffer, offset: 0, index: 0)
@@ -467,7 +663,7 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
                 
                 // Create a temporary active voxel buffer for this chunk
                 let activeVoxelPtr = activeVoxelBuffer.contents().bindMemory(to: UInt32.self, capacity: compactedCount)
-                let chunkActiveVoxels = Array(UnsafeBufferPointer(start: activeVoxelPtr.advanced(by: startVoxel), count: chunkSize))
+                chunkActiveVoxels = Array(UnsafeBufferPointer(start: activeVoxelPtr.advanced(by: startVoxel), count: chunkSize))
                 
                 guard let chunkActiveBuffer = device.makeBuffer(
                     bytes: chunkActiveVoxels,
@@ -494,13 +690,19 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
             
             let chunkIndexCount = chunkSize * 36
             
+            // Calculate bounding box for this chunk
+            let chunkVoxelIndices = chunkActiveVoxels
+            let bounds = calculateChunkBounds(voxelIndices: chunkVoxelIndices)
+            
             vertexBuffers.append(vertexBuffer)
             indexBuffers.append(indexBuffer)
             indexCounts.append(chunkIndexCount)
             chunkOffsets.append(startVoxel)
+            chunkBounds.append(bounds)
             totalIndexCount += chunkIndexCount
             
             print("  Generated \(chunkIndexCount) indices for chunk")
+            print("  Bounds: min(\(bounds.min.x), \(bounds.min.y), \(bounds.min.z)) max(\(bounds.max.x), \(bounds.max.y), \(bounds.max.z))")
         }
         
         print("\n=== Mesh Generation Complete ===")
@@ -556,26 +758,67 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
         let modelMatrix = matrix_identity_float4x4
         let viewProj = projection * viewMatrix * modelMatrix
         
+        // Create frustum for culling
+        let frustum = Frustum(viewProjectionMatrix: viewProj)
+        
         var uniforms = Uniforms(viewProjectionMatrix: viewProj)
         let uniformBuffer = device.makeBuffer(bytes: &uniforms,
                                              length: MemoryLayout<Uniforms>.stride,
                                              options: [])
         
-        // Draw voxels - iterate through all chunks
+        // Draw voxels - iterate through all chunks with frustum culling
         encoder.setRenderPipelineState(renderPipeline)
         encoder.setDepthStencilState(depthStencilState)
         encoder.setCullMode(.back)
         encoder.setFrontFacing(.counterClockwise)
         encoder.setVertexBuffer(uniformBuffer, offset: 0, index: 1)
         
+        var renderedChunks = 0
+        var culledChunks = 0
+        var debugInfo: [(Int, Bool, AABB)] = []
+        
         for i in 0..<vertexBuffers.count {
-            encoder.setVertexBuffer(vertexBuffers[i], offset: 0, index: 0)
-            encoder.drawIndexedPrimitives(
-                type: .triangle,
-                indexCount: indexCounts[i],
-                indexType: .uint32,
-                indexBuffer: indexBuffers[i],
-                indexBufferOffset: 0)
+            let shouldRender = !enableFrustumCulling || isChunkVisible(chunkIndex: i, frustum: frustum, cameraPosition: eye)
+            
+            if debugFrustumCulling && enableFrustumCulling && i < chunkBounds.count {
+                debugInfo.append((i, shouldRender, chunkBounds[i]))
+            }
+            
+            if shouldRender {
+                encoder.setVertexBuffer(vertexBuffers[i], offset: 0, index: 0)
+                encoder.drawIndexedPrimitives(
+                    type: .triangle,
+                    indexCount: indexCounts[i],
+                    indexType: .uint32,
+                    indexBuffer: indexBuffers[i],
+                    indexBufferOffset: 0)
+                renderedChunks += 1
+            } else {
+                culledChunks += 1
+            }
+        }
+        
+        // Print detailed culling info occasionally
+        if debugFrustumCulling && enableFrustumCulling && Int.random(in: 0..<120) == 0 {
+            print("\n=== Frustum Culling Debug ===")
+            print("Camera: eye=\(eye), target=\(cameraTarget), distance=\(cameraDistance)")
+            print("Rendered: \(renderedChunks), Culled: \(culledChunks)")
+            
+            for (index, visible, bounds) in debugInfo {
+                let center = bounds.center
+                let size = bounds.max - bounds.min
+                print("  Chunk \(index): \(visible ? "✓ VISIBLE" : "✗ CULLED") - center: (\(String(format: "%.2f", center.x)), \(String(format: "%.2f", center.y)), \(String(format: "%.2f", center.z))) size: (\(String(format: "%.2f", size.x)), \(String(format: "%.2f", size.y)), \(String(format: "%.2f", size.z)))")
+            }
+            
+            // Test if camera is inside any chunk bounds
+            for (index, _, bounds) in debugInfo {
+                if eye.x >= bounds.min.x && eye.x <= bounds.max.x &&
+                   eye.y >= bounds.min.y && eye.y <= bounds.max.y &&
+                   eye.z >= bounds.min.z && eye.z <= bounds.max.z {
+                    print("  ⚠️  Camera is INSIDE chunk \(index) bounds!")
+                }
+            }
+            print("=============================\n")
         }
         
         // draw grids
