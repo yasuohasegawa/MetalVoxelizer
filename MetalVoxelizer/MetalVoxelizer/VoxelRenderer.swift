@@ -872,7 +872,8 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
 
             let deltaX = Float(currentLocation.x - last.x) * 0.01
             let deltaY = Float(currentLocation.y - last.y) * 0.01
-            let rotSpeed: Float = 0.5
+            let clampedDistance = max(cameraDistance, 0.5)
+            let rotSpeed: Float = 0.5 * (clampedDistance / 3.0)
             let yawQuat = simd_quatf(angle: -deltaX * rotSpeed, axis: SIMD3<Float>(0,1,0))
             let rightAxis = simd_act(orientation, SIMD3<Float>(1,0,0))
             let pitchQuat = simd_quatf(angle: -deltaY * rotSpeed, axis: rightAxis)
@@ -887,7 +888,8 @@ class VoxelRenderer: NSObject, MTKViewDelegate {
     @objc private func handleTwoFingerPan(_ gesture: UIPanGestureRecognizer) {
         if gesture.state == .changed {
             let translation = gesture.translation(in: gesture.view)
-            let panSpeed: Float = 0.002 * cameraDistance
+            let clampedDistance = max(cameraDistance, 0.5)
+            let panSpeed: Float = 0.002 * clampedDistance
             let forward = simd_act(orientation, SIMD3<Float>(0,0,-1))
             let up = simd_act(orientation, SIMD3<Float>(0,1,0))
             let right = simd_cross(forward, up)

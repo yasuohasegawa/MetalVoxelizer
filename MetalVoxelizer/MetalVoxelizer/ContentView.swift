@@ -59,11 +59,11 @@ struct ContentView: View {
                 .padding(.bottom, 30)
             }
             
-            // Crosshair for aiming
-            Circle()
-                .stroke(Color.white, lineWidth: 2)
-                .frame(width: 20, height: 20)
-                .shadow(color: .black, radius: 2)
+//            // Crosshair for aiming
+//            Circle()
+//                .stroke(Color.white, lineWidth: 2)
+//                .frame(width: 20, height: 20)
+//                .shadow(color: .black, radius: 2)
         }
         .edgesIgnoringSafeArea(.all)
     }
